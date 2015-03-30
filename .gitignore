@@ -44,9 +44,9 @@ Temporary Items
 .tmp
 tmp
 tmp/*
-jspm_packages/github
-jspm_packages/github*
-
+# jspm_packages/github
+# jspm_packages/github*
+jspm_packages/github/mrdoob/three.js@master/examples
 
 # cache files for sublime text
 .tmlanguage.cache
