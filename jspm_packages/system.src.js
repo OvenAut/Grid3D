@@ -1,5 +1,5 @@
 /*
- * SystemJS v0.13.2
+ * SystemJS v0.16.6
  */
 
 (function($__global) {
@@ -14,6 +14,8 @@ $__global.upgradeSystemLoader = function() {
         return i;
     return -1;
   }
+
+  var isWindows = typeof process != 'undefined' && !!process.platform.match(/^win/);
 
   // Absolute URL parsing, from https://gist.github.com/Yaffle/1088850
   function parseURI(url) {
@@ -45,6 +47,9 @@ $__global.upgradeSystemLoader = function() {
       });
       return output.join('').replace(/^\//, input.charAt(0) === '/' ? '/' : '');
     }
+
+    if (isWindows)
+      href = href.replace(/\\/g, '/');
 
     href = parseURI(href || '');
     base = parseURI(base || '');
@@ -144,6 +149,8 @@ function core(loader) {
   if (typeof window == 'undefined' &&
       typeof WorkerGlobalScope == 'undefined') {
     baseURI = 'file:' + process.cwd() + '/';
+    if (isWindows)
+      baseURI = baseURI.replace(/\\/g, '/');
   }
   // Inside of a Web Worker
   else if(typeof window == 'undefined') {
@@ -318,9 +325,6 @@ function register(loader) {
   var curSystem;
   function exec(load) {
     var loader = this;
-    if (load.name == '@traceur') {
-      curSystem = System;
-    }
     // support sourceMappingURL (efficiently)
     var sourceMappingURL;
     var lastLineIndex = load.source.lastIndexOf('\n');
@@ -333,12 +337,6 @@ function register(loader) {
     }
 
     __eval(load.source, load.address, sourceMappingURL);
-
-    // traceur overwrites System and Module - write them back
-    if (load.name == '@traceur') {
-      loader.global.traceurSystem = loader.global.System;
-      loader.global.System = curSystem;
-    }
   }
   loader.__exec = exec;
 
@@ -589,7 +587,10 @@ function register(loader) {
       }
       // dynamic, already linked in our registry
       else if (depEntry && !depEntry.declarative) {
-        depExports = { 'default': depEntry.module.exports, '__useDefault': true };
+        if (depEntry.module.exports && depEntry.module.exports.__esModule)
+          depExports = depEntry.module.exports;
+        else
+          depExports = { 'default': depEntry.module.exports, '__useDefault': true };
       }
       // in the loader registry
       else if (!depEntry) {
@@ -807,7 +808,7 @@ function register(loader) {
     // named bundles are just an empty module
     if (!entry && load.metadata.format != 'es6')
       return {
-        deps: [],
+        deps: load.metadata.deps,
         execute: function() {
           return loader.newModule({});
         }
@@ -846,10 +847,13 @@ function register(loader) {
           // remove from the registry
           loader.defined[load.name] = undefined;
 
-          var module = loader.newModule(entry.declarative ? entry.module.exports : { 'default': entry.module.exports, '__useDefault': true });
+          var module = entry.module.exports;
+
+          if (!module || !entry.declarative && module.__esModule !== true)
+            module = { 'default': module, __useDefault: true };
 
           // return the defined module object
-          return module;
+          return loader.newModule(module);
         }
       };
     });
@@ -859,86 +863,91 @@ function register(loader) {
  * Extension to detect ES6 and auto-load Traceur or Babel for processing
  */
 function es6(loader) {
-
   loader._extensions.push(es6);
-
-  var transpiler, transpilerModule, transpilerRuntimeModule, transpilerRuntimeGlobal;
-
-  var isBrowser = typeof window != 'undefined';
-
-  function setTranspiler(name) {
-    transpiler = name;
-    transpilerModule = '@' + transpiler;
-    transpilerRuntimeModule = transpilerModule + (transpiler == 'babel' ? '-helpers' : '-runtime');
-    transpilerRuntimeGlobal = transpiler == 'babel' ? transpiler + 'Helpers' : '$' + transpiler + 'Runtime';
-
-    // auto-detection of paths to loader transpiler files
-    var scriptBase;
-    if ($__curScript && $__curScript.src)
-      scriptBase = $__curScript.src.substr(0, $__curScript.src.lastIndexOf('/') + 1);
-    else
-      scriptBase = loader.baseURL + (loader.baseURL.lastIndexOf('/') == loader.baseURL.length - 1 ? '' : '/');
-
-    if (!loader.paths[transpilerModule])
-      loader.paths[transpilerModule] = $__curScript && $__curScript.getAttribute('data-' + loader.transpiler + '-src') || scriptBase + loader.transpiler + '.js';
-    
-    if (!loader.paths[transpilerRuntimeModule])
-      loader.paths[transpilerRuntimeModule] = $__curScript && $__curScript.getAttribute('data-' + transpilerRuntimeModule.substr(1) + '-src') || scriptBase + transpilerRuntimeModule.substr(1) + '.js';
-  }
 
   // good enough ES6 detection regex - format detections not designed to be accurate, but to handle the 99% use case
   var es6RegEx = /(^\s*|[}\);\n]\s*)(import\s+(['"]|(\*\s+as\s+)?[^"'\(\)\n;]+\s+from\s+['"]|\{)|export\s+\*\s+from\s+["']|export\s+(\{|default|function|class|var|const|let|async\s+function))/;
 
+  var traceurRuntimeRegEx = /\$traceurRuntime\s*\./;
+  var babelHelpersRegEx = /babelHelpers\s*\./;
+
+  var transpilerNormalized, transpilerRuntimeNormalized;
+
+  var firstLoad = true;
+
+  var nodeResolver = typeof process != 'undefined' && typeof require != 'undefined' && require.resolve;
+
+  function setConfig(loader, module, nodeModule) {
+    loader.meta[module] = {format: 'global'};
+    if (nodeResolver && !loader.paths[module]) {
+      try {
+        loader.paths[module] = require.resolve(nodeModule || module);
+      }
+      catch(e) {}
+    }
+  }
+
+  var loaderLocate = loader.locate;
+  loader.locate = function(load) {
+    var self = this;
+    if (firstLoad) {
+      if (self.transpiler == 'traceur') {
+        setConfig(self, 'traceur', 'traceur/bin/traceur.js');
+        self.meta['traceur'].exports = 'traceur';
+        setConfig(self, 'traceur-runtime', 'traceur/bin/traceur-runtime.js');
+      }
+      else if (self.transpiler == 'babel') {
+        setConfig(self, 'babel', 'babel-core/browser.js');
+        setConfig(self, 'babel-runtime', 'babel-core/external-helpers.js');
+      }
+      firstLoad = false;
+    }
+    return loaderLocate.call(self, load);
+  };
+
   var loaderTranslate = loader.translate;
   loader.translate = function(load) {
-    // update transpiler info if necessary
-    if (this.transpiler !== transpiler)
-      setTranspiler(this.transpiler);
-
     var loader = this;
 
-    if (load.name == transpilerModule || load.name == transpilerRuntimeModule)
-      return loaderTranslate.call(loader, load);
+    return loaderTranslate.call(loader, load)
+    .then(function(source) {
 
-    // detect ES6
-    else if (load.metadata.format == 'es6' || !load.metadata.format && load.source.match(es6RegEx)) {
-      load.metadata.format = 'es6';
+      // detect ES6
+      if (load.metadata.format == 'es6' || !load.metadata.format && source.match(es6RegEx)) {
+        load.metadata.format = 'es6';
+        return source;
+      }
 
-      // dynamically load transpiler for ES6 if necessary
-      if (isBrowser && !loader.global[transpiler])
-        return loader['import'](transpilerModule).then(function() {
-          return loaderTranslate.call(loader, load);
-        });
-    }
-
-    // dynamically load transpiler runtime if necessary
-    if (isBrowser && !loader.global[transpilerRuntimeGlobal] && load.source.indexOf(transpilerRuntimeGlobal) != -1) {
-      var System = $__global.System;
-      return loader['import'](transpilerRuntimeModule).then(function() {
-        // traceur runtme annihilates System global
-        $__global.System = System;
-        return loaderTranslate.call(loader, load);
-      });
-    }
-
-    return loaderTranslate.call(loader, load);
-  }
-
-  // always load transpiler as a global
-  var loaderInstantiate = loader.instantiate;
-  loader.instantiate = function(load) {
-    var loader = this;
-    if (isBrowser && (load.name == transpilerModule || load.name == transpilerRuntimeModule)) {
-      loader.__exec(load);
-      return {
-        deps: [],
-        execute: function() {
-          return loader.newModule({});
+      if (load.metadata.format == 'register') {
+        if (!loader.global.$traceurRuntime && load.source.match(traceurRuntimeRegEx)) {
+          return loader['import']('traceur-runtime').then(function() {
+            return source;
+          });
         }
-      };
-    }
-    return loaderInstantiate.call(loader, load);
-  }
+        if (!loader.global.babelHelpers && load.source.match(babelHelpersRegEx)) {
+          return loader['import']('babel/external-helpers').then(function() {
+            return source;
+          });
+        }
+      }
+
+      // ensure Traceur doesn't clobber the System global
+      if (loader.transpiler == 'traceur')
+        return Promise.all([
+          transpilerNormalized || (transpilerNormalized = loader.normalize(loader.transpiler)),
+          transpilerRuntimeNormalized || (transpilerRuntimeNormalized = loader.normalize(loader.transpiler + '-runtime'))
+        ])
+        .then(function(normalized) {
+          if (load.name == normalized[0] || load.name == normalized[1])
+            return '(function() { var curSystem = System; ' + source + '\nSystem = curSystem; })();';
+
+          return source;
+        });
+
+      return source;
+    });
+
+  };
 
 }
 /*
@@ -988,7 +997,8 @@ function global(loader) {
         curGlobalObj = {};
         ignoredGlobalProps = ['indexedDB', 'sessionStorage', 'localStorage',
           'clipboardData', 'frames', 'webkitStorageInfo', 'toolbar', 'statusbar',
-          'scrollbars', 'personalbar', 'menubar', 'locationbar', 'webkitIndexedDB'
+          'scrollbars', 'personalbar', 'menubar', 'locationbar', 'webkitIndexedDB',
+          'screenTop', 'screenLeft'
         ];
         for (var g in loader.global) {
           if (indexOf.call(ignoredGlobalProps, g) != -1) { continue; }
@@ -1007,12 +1017,8 @@ function global(loader) {
         var exports = {};
 
         // run init
-        if (init) {
-          var depModules = [];
-          for (var i = 0; i < deps.length; i++)
-            depModules.push(require(deps[i]));
-          singleGlobal = init.apply(loader.global, depModules);
-        }
+        if (init)
+          singleGlobal = init.call(loader.global);
 
         // check for global changes, creating the globalObject for the module
         // if many globals, then a module object for those is created
@@ -1252,7 +1258,9 @@ function amd(loader) {
     else
       throw new TypeError('Invalid require');
   };
-  loader.amdRequire = require;
+  loader.amdRequire = function() {
+    return require.apply(this, arguments);
+  };
 
   function makeRequire(parentName, staticRequire, loader) {
     return function(names, callback, errback) {
@@ -1661,7 +1669,7 @@ function plugins(loader) {
       // standard normalization
       return name;
     });
-  }
+  };
 
   var loaderLocate = loader.locate;
   loader.locate = function(load) {
@@ -1714,12 +1722,13 @@ function plugins(loader) {
     }
 
     return loaderLocate.call(this, load);
-  }
+  };
 
   var loaderFetch = loader.fetch;
   loader.fetch = function(load) {
     var loader = this;
-    if (load.metadata.build === false)
+    // ignore fetching build = false unless in a plugin loader
+    if (load.metadata.build === false && loader.pluginLoader)
       return '';
     else if (load.metadata.plugin && load.metadata.plugin.fetch && !load.metadata.pluginFetchCalled) {
       load.metadata.pluginFetchCalled = true;
@@ -2177,7 +2186,7 @@ function depCache(loader) {
 
   loader._extensions.push(depCache);
 
-  loaderLocate = loader.locate;
+  var loaderLocate = loader.locate;
   loader.locate = function(load) {
     var loader = this;
 
@@ -2231,11 +2240,7 @@ var $__curScript, __eval;
     }
   };
 
-  var isWorker = typeof WorkerGlobalScope !== 'undefined' &&
-    self instanceof WorkerGlobalScope;
-  var isBrowser = typeof window != 'undefined';
-
-  if (isBrowser) {
+  if (typeof document != 'undefined') {
     var head;
 
     var scripts = document.getElementsByTagName('script');
@@ -2272,7 +2277,7 @@ var $__curScript, __eval;
       $__global.upgradeSystemLoader();
     }
   }
-  else if(isWorker) {
+  else if (typeof WorkerGlobalScope != 'undefined' && typeof importScripts != 'undefined') {
     doEval = function(source) {
       try {
         eval(source);
@@ -2284,13 +2289,14 @@ var $__curScript, __eval;
     if (!$__global.System || !$__global.LoaderPolyfill) {
       var basePath = '';
       try {
-        throw new TypeError('Unable to get Worker base path.');
-      } catch(err) {
-        var idx = err.stack.indexOf('at ') + 3;
-        var withSystem = err.stack.substr(idx, err.stack.substr(idx).indexOf('\n'));
-        basePath = withSystem.substr(0, withSystem.lastIndexOf('/') + 1);
+        throw new Error('Get worker base path via error stack');
+      } catch (e) {
+        e.stack.replace(/(?:at|@).*(http.+):[\d]+:[\d]+/, function (m, url) {
+          basePath = url.replace(/\/[^\/]*$/, '/');
+        });
       }
       importScripts(basePath + 'es6-module-loader.js');
+      $__global.upgradeSystemLoader();
     } else {
       $__global.upgradeSystemLoader();
     }
